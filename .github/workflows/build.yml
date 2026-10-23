@@ -1,0 +1,64 @@
+name: Build macOS App
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Build and package app
+        run: ./build_app.sh
+
+      - name: Verify bundle
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          plutil -lint MacDLNA.app/Contents/Info.plist
+          codesign --verify --deep --strict --verbose=2 MacDLNA.app
+          lipo -verify_arch "$EXPECTED_ARCH" MacDLNA.app/Contents/MacOS/MacDLNA
+
+      - name: Archive app
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: ditto -c -k --sequesterRsrc --keepParent MacDLNA.app "MacDLNA-macos-${ARCH}.zip"
+
+      - name: Upload app
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: MacDLNA-macos-${{ matrix.arch }}
+          path: MacDLNA-macos-${{ matrix.arch }}.zip
+          if-no-files-found: error
+          retention-days: 14
