@@ -48,7 +48,7 @@ jobs:
         run: |
           plutil -lint MacDLNA.app/Contents/Info.plist
           codesign --verify --deep --strict --verbose=2 MacDLNA.app
-          lipo -verify_arch "$EXPECTED_ARCH" MacDLNA.app/Contents/MacOS/MacDLNA
+          lipo MacDLNA.app/Contents/MacOS/MacDLNA -verify_arch "$EXPECTED_ARCH"
 
       - name: Archive app
         env:
