@@ -324,6 +324,7 @@ struct MainMenuView: View {
                 )
                 .disabled(audio.duration <= 0)
                 
+                TrackSkipButton(audio: audio, forward: false)
                 Button(action: {
                     if audio.state == .playing {
                         audio.pause()
@@ -336,6 +337,7 @@ struct MainMenuView: View {
                         .foregroundColor(.primary)
                 }
                 .buttonStyle(.plain)
+                TrackSkipButton(audio: audio, forward: true)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
@@ -510,6 +512,7 @@ struct MainMenuView: View {
                 .buttonStyle(.plain)
                 .disabled(audio.state == .noMedia || audio.state == .stopped)
                 
+                TrackSkipButton(audio: audio, forward: false)
                 Button(action: {
                     if audio.state == .playing {
                         audio.pause()
@@ -525,7 +528,8 @@ struct MainMenuView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(audio.state == .noMedia)
-                
+                TrackSkipButton(audio: audio, forward: true)
+
                 Spacer()
             }
         }
@@ -673,5 +677,27 @@ struct MainMenuView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
+    }
+}
+
+private struct TrackSkipButton: View {
+    @ObservedObject var audio: AudioEngine
+    let forward: Bool
+
+    private var available: Bool { forward ? audio.canGoNext : audio.canGoPrevious }
+    private var label: String { forward ? "下一曲" : "上一曲" }
+
+    var body: some View {
+        Button(action: {
+            if forward { audio.next() } else { audio.previous() }
+        }) {
+            Image(systemName: forward ? "forward.end.fill" : "backward.end.fill")
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!available)
+        .accessibilityLabel(label)
+        .help(available ? label : (forward ? "控制端尚未提供下一首" : "暂无已播放曲目"))
     }
 }

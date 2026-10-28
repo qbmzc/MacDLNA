@@ -385,6 +385,10 @@ public final class UPnPXMLTemplates {
           <dataType>string</dataType>
         </stateVariable>
         <stateVariable sendEvents="yes">
+          <name>LastChange</name>
+          <dataType>string</dataType>
+        </stateVariable>
+        <stateVariable sendEvents="no">
           <name>TransportState</name>
           <dataType>string</dataType>
           <allowedValueList>
@@ -627,6 +631,10 @@ public final class UPnPXMLTemplates {
           </allowedValueList>
         </stateVariable>
         <stateVariable sendEvents="yes">
+          <name>LastChange</name>
+          <dataType>string</dataType>
+        </stateVariable>
+        <stateVariable sendEvents="no">
           <name>Volume</name>
           <dataType>ui2</dataType>
           <allowedValueRange>
@@ -635,7 +643,7 @@ public final class UPnPXMLTemplates {
             <step>1</step>
           </allowedValueRange>
         </stateVariable>
-        <stateVariable sendEvents="yes">
+        <stateVariable sendEvents="no">
           <name>Mute</name>
           <dataType>boolean</dataType>
           <defaultValue>0</defaultValue>

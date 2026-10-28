@@ -59,6 +59,9 @@ jobs:
           swift --version
           xcodebuild -version
 
+      - name: Run tests
+        run: swift test
+
       - name: Build and package app
         run: ./build_app.sh
 

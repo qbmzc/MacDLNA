@@ -9,11 +9,24 @@ public final class UPnPHTTPServer {
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "com.macdlna.httpserver", qos: .userInitiated)
     private var isRunning = false
+    private let events = EventSubscriptions()
+    private let engine: AudioEngine
+    private var eventObserver: NSObjectProtocol?
+    private var pendingInitialSID: String?
+
     
-    public init(port: Int = 8585, uuid: String, friendlyName: String) {
+    public init(port: Int = 8585, uuid: String, friendlyName: String, engine: AudioEngine = .shared) {
+        self.engine = engine
         self.port = port
         self.uuid = uuid
         self.friendlyName = friendlyName
+        events.snapshot = { [weak self] path in self?.eventBody(path: path) ?? "" }
+        eventObserver = NotificationCenter.default.addObserver(
+            forName: AudioEngine.transportChanged, object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let self, let source = notification.object as? AudioEngine, source === self.engine else { return }
+            self.events.notifyChanges()
+        }
     }
     
     public func start() throws {
@@ -31,9 +44,9 @@ public final class UPnPHTTPServer {
             switch state {
             case .ready:
                 self.isRunning = true
-                AudioEngine.shared.log("HTTP 服务已启动，监听端口: \(self.port)")
+                self.engine.log("HTTP 服务已启动，监听端口: \(self.port)")
             case .failed(let error):
-                AudioEngine.shared.log("HTTP 服务发生异常: \(error.localizedDescription)")
+                self.engine.log("HTTP 服务发生异常: \(error.localizedDescription)")
                 self.isRunning = false
             case .cancelled:
                 self.isRunning = false
@@ -49,12 +62,16 @@ public final class UPnPHTTPServer {
         nwListener.start(queue: queue)
     }
     
+    deinit {
+        if let eventObserver { NotificationCenter.default.removeObserver(eventObserver) }
+    }
+
     public func stop() {
-        guard isRunning else { return }
+        events.removeAll()
         listener?.cancel()
         listener = nil
         isRunning = false
-        AudioEngine.shared.log("HTTP 服务已停止")
+        self.engine.log("HTTP 服务已停止")
     }
     
     // MARK: - Connection Handling
@@ -77,8 +94,16 @@ public final class UPnPHTTPServer {
             // 尝试解析请求
             if let request = self.parseHTTPRequest(from: currentData) {
                 // 请求已完整接收
-                let response = self.route(request: request)
-                self.sendResponse(connection: connection, response: response)
+                let (response, initialSID) = DispatchQueue.main.sync {
+                    self.pendingInitialSID = nil
+                    let response = self.route(request: request)
+                    return (response, self.pendingInitialSID)
+                }
+                connection.send(content: response, completion: .contentProcessed { [weak self] error in
+                    connection.cancel()
+                    guard error == nil, let initialSID else { return }
+                    DispatchQueue.main.async { self?.events.activate(sid: initialSID) }
+                })
             } else if error != nil || isComplete {
                 // 连接结束但未构成完整请求，优雅关闭
                 connection.cancel()
@@ -97,7 +122,7 @@ public final class UPnPHTTPServer {
     
     // MARK: - HTTP Request Parsing
     
-    private struct ParsedRequest {
+    struct ParsedRequest {
         let method: String
         let path: String
         let headers: [String: String]
@@ -150,27 +175,13 @@ public final class UPnPHTTPServer {
     
     // MARK: - HTTP Routing
     
-    private func route(request: ParsedRequest) -> Data {
+    func route(request: ParsedRequest) -> Data {
         let cleanPath = request.path.components(separatedBy: "?").first ?? request.path
         
-        // GENA Event 订阅处理 (BubbleUPnP / QQ 音乐常用)
-        if request.method == "SUBSCRIBE" {
-            let sid = "uuid:\(UUID().uuidString.lowercased())"
-            AudioEngine.shared.log("收到 UPnP 事件订阅: \(cleanPath)")
-            let resp = "HTTP/1.1 200 OK\r\n" +
-                       "SERVER: Darwin/23.0.0 UPnP/1.0 MacDLNA/1.0\r\n" +
-                       "SID: \(sid)\r\n" +
-                       "TIMEOUT: Second-1800\r\n" +
-                       "Content-Length: 0\r\n" +
-                       "Connection: close\r\n\r\n"
-            return resp.data(using: .utf8)!
+        if request.method == "SUBSCRIBE" || request.method == "UNSUBSCRIBE" {
+            return handleSubscription(request: request, path: cleanPath)
         }
-        
-        if request.method == "UNSUBSCRIBE" {
-            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            return resp.data(using: .utf8)!
-        }
-        
+
         // GET / HEAD 设备描述与 SCPD XML
         if request.method == "GET" || request.method == "HEAD" {
             let isHead = (request.method == "HEAD")
@@ -227,17 +238,27 @@ public final class UPnPHTTPServer {
     private func handleAVTransportSOAP(actionHeader: String, body: String) -> Data {
         let serviceType = "urn:schemas-upnp-org:service:AVTransport:1"
         let action = extractSOAPActionName(actionHeader: actionHeader, body: body)
-        let engine = AudioEngine.shared
-        
+        let engine = self.engine
+        if let instance = extractXMLTag(name: "InstanceID", from: body), instance != "0" {
+            return makeXMLResponse(statusCode: 500, body: UPnPXMLTemplates.soapFault(code: 718, description: "Invalid InstanceID"))
+        }
+
         switch action {
         case "SetAVTransportURI":
             let uri = extractXMLTag(name: "CurrentURI", from: body) ?? ""
             let meta = extractXMLTag(name: "CurrentURIMetaData", from: body)
+            guard validMediaURI(uri) else {
+                return makeXMLResponse(statusCode: 500, body: UPnPXMLTemplates.soapFault(code: 716, description: "Resource not found"))
+            }
             engine.setURI(uri: uri, metadata: meta)
             let resp = UPnPXMLTemplates.soapResponse(serviceType: serviceType, action: action, body: "")
             return makeXMLResponse(body: resp)
             
         case "SetNextAVTransportURI":
+            guard let uri = extractXMLTag(name: "NextURI", from: body), validMediaURI(uri) else {
+                return makeXMLResponse(statusCode: 500, body: UPnPXMLTemplates.soapFault(code: 716, description: "Resource not found"))
+            }
+            engine.setNextURI(uri: uri, metadata: extractXMLTag(name: "NextURIMetaData", from: body))
             let resp = UPnPXMLTemplates.soapResponse(serviceType: serviceType, action: action, body: "")
             return makeXMLResponse(body: resp)
             
@@ -264,6 +285,9 @@ public final class UPnPHTTPServer {
             return makeXMLResponse(body: resp)
             
         case "Next", "Previous":
+            guard action == "Next" ? engine.next() : engine.previous() else {
+                return makeXMLResponse(statusCode: 500, body: UPnPXMLTemplates.soapFault(code: 701, description: "Transition not available"))
+            }
             let resp = UPnPXMLTemplates.soapResponse(serviceType: serviceType, action: action, body: "")
             return makeXMLResponse(body: resp)
             
@@ -322,8 +346,8 @@ public final class UPnPHTTPServer {
                 <MediaDuration>\(dur)</MediaDuration>
                 <CurrentURI>\(uriEscaped)</CurrentURI>
                 <CurrentURIMetaData>\(metaEscaped)</CurrentURIMetaData>
-                <NextURI></NextURI>
-                <NextURIMetaData></NextURIMetaData>
+                <NextURI>\(UPnPXMLTemplates.xmlEscape(engine.nextURI))</NextURI>
+                <NextURIMetaData>\(UPnPXMLTemplates.xmlEscape(engine.nextMetadata))</NextURIMetaData>
                 <PlayMedium>NETWORK</PlayMedium>
                 <RecordMedium>NOT_IMPLEMENTED</RecordMedium>
                 <WriteStatus>NOT_IMPLEMENTED</WriteStatus>
@@ -333,13 +357,13 @@ public final class UPnPHTTPServer {
             
         case "GetCurrentTransportActions":
             let xmlBody = """
-                <Actions>Play,Pause,Stop,Seek</Actions>
+                <Actions>\(engine.transportActions)</Actions>
             """
             let resp = UPnPXMLTemplates.soapResponse(serviceType: serviceType, action: action, body: xmlBody)
             return makeXMLResponse(body: resp)
             
         default:
-            AudioEngine.shared.log("未识别的 AVTransport 指令: \(action)")
+            self.engine.log("未识别的 AVTransport 指令: \(action)")
             let resp = UPnPXMLTemplates.soapFault(code: 401, description: "Invalid Action")
             return makeXMLResponse(statusCode: 500, body: resp)
         }
@@ -348,7 +372,7 @@ public final class UPnPHTTPServer {
     private func handleRenderingControlSOAP(actionHeader: String, body: String) -> Data {
         let serviceType = "urn:schemas-upnp-org:service:RenderingControl:1"
         let action = extractSOAPActionName(actionHeader: actionHeader, body: body)
-        let engine = AudioEngine.shared
+        let engine = self.engine
         
         switch action {
         case "GetVolume":
@@ -376,7 +400,7 @@ public final class UPnPHTTPServer {
             return makeXMLResponse(body: resp)
             
         default:
-            AudioEngine.shared.log("未识别的 RenderingControl 指令: \(action)")
+            self.engine.log("未识别的 RenderingControl 指令: \(action)")
             let resp = UPnPXMLTemplates.soapFault(code: 401, description: "Invalid Action")
             return makeXMLResponse(statusCode: 500, body: resp)
         }
@@ -388,27 +412,7 @@ public final class UPnPHTTPServer {
         
         switch action {
         case "GetProtocolInfo":
-            let sinkProtocols = [
-                "http-get:*:audio/mpeg:*",
-                "http-get:*:audio/mp3:*",
-                "http-get:*:audio/x-mp3:*",
-                "http-get:*:audio/flac:*",
-                "http-get:*:audio/x-flac:*",
-                "http-get:*:audio/mp4:*",
-                "http-get:*:audio/m4a:*",
-                "http-get:*:audio/x-m4a:*",
-                "http-get:*:audio/alac:*",
-                "http-get:*:audio/x-alac:*",
-                "http-get:*:audio/aac:*",
-                "http-get:*:audio/wav:*",
-                "http-get:*:audio/x-wav:*",
-                "http-get:*:audio/ogg:*",
-                "http-get:*:application/ogg:*",
-                "http-get:*:audio/*:*",
-                "http-get:*:application/vnd.apple.mpegurl:*",
-                "http-get:*:application/x-mpegURL:*",
-                "http-get:*:*"
-            ].joined(separator: ",")
+            let sinkProtocols = Self.sinkProtocols
             let xmlBody = """
                 <Source></Source>
                 <Sink>\(sinkProtocols)</Sink>
@@ -435,12 +439,108 @@ public final class UPnPHTTPServer {
             return makeXMLResponse(body: resp)
             
         default:
-            AudioEngine.shared.log("未识别的 ConnectionManager 指令: \(action)")
+            self.engine.log("未识别的 ConnectionManager 指令: \(action)")
             let resp = UPnPXMLTemplates.soapFault(code: 401, description: "Invalid Action")
             return makeXMLResponse(statusCode: 500, body: resp)
         }
     }
     
+    private static let sinkProtocols = [
+                "http-get:*:audio/mpeg:*",
+                "http-get:*:audio/mp3:*",
+                "http-get:*:audio/x-mp3:*",
+                "http-get:*:audio/flac:*",
+                "http-get:*:audio/x-flac:*",
+                "http-get:*:audio/mp4:*",
+                "http-get:*:audio/m4a:*",
+                "http-get:*:audio/x-m4a:*",
+                "http-get:*:audio/alac:*",
+                "http-get:*:audio/x-alac:*",
+                "http-get:*:audio/aac:*",
+                "http-get:*:audio/wav:*",
+                "http-get:*:audio/x-wav:*",
+                "http-get:*:audio/ogg:*",
+                "http-get:*:application/ogg:*",
+                "http-get:*:audio/*:*",
+                "http-get:*:application/vnd.apple.mpegurl:*",
+                "http-get:*:application/x-mpegURL:*",
+                "http-get:*:*"
+            ].joined(separator: ",")
+
+    private func validMediaURI(_ uri: String) -> Bool {
+        if uri.isEmpty { return true }
+        guard let url = URL(string: uri), let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme), url.host != nil else { return false }
+        return true
+    }
+
+    private func handleSubscription(request: ParsedRequest, path: String) -> Data {
+        guard ["/AVTransport/event", "/RenderingControl/event", "/ConnectionManager/event"].contains(path) else {
+            return makeTextResponse(statusCode: 404, statusText: "Not Found", body: "")
+        }
+        let headers = request.headers
+        let timeout = min(1800, max(1, Int(headers["timeout"]?.replacingOccurrences(of: "Second-", with: "") ?? "") ?? 1800))
+        let sid: String
+        if let existing = headers["sid"] {
+            guard headers["callback"] == nil, headers["nt"] == nil else {
+                return makeTextResponse(statusCode: 400, statusText: "Bad Request", body: "")
+            }
+            if request.method == "UNSUBSCRIBE" {
+                guard events.unsubscribe(sid: existing, path: path) else {
+                    return makeTextResponse(statusCode: 412, statusText: "Precondition Failed", body: "")
+                }
+                return makeTextResponse(statusCode: 200, statusText: "OK", body: "")
+            }
+            guard events.renew(sid: existing, path: path, timeout: TimeInterval(timeout)) else {
+                return makeTextResponse(statusCode: 412, statusText: "Precondition Failed", body: "")
+            }
+            sid = existing
+        } else {
+            guard request.method == "SUBSCRIBE", headers["nt"]?.lowercased() == "upnp:event",
+                  let callback = headers["callback"], let start = callback.firstIndex(of: "<"),
+                  let end = callback[start...].firstIndex(of: ">"),
+                  let url = URL(string: String(callback[callback.index(after: start)..<end])),
+                  url.scheme?.lowercased() == "http", url.host != nil,
+                  url.user == nil, url.password == nil else {
+                return makeTextResponse(statusCode: 412, statusText: "Precondition Failed", body: "")
+            }
+            sid = events.subscribe(path: path, callback: url, timeout: TimeInterval(timeout))
+            pendingInitialSID = sid
+            self.engine.log("已订阅播放状态: \(path)")
+        }
+        return Data("HTTP/1.1 200 OK\r\nSID: \(sid)\r\nTIMEOUT: Second-\(timeout)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
+    }
+
+    private func eventBody(path: String) -> String {
+        let engine = self.engine
+        func property(_ name: String, _ value: String) -> String {
+            "<e:property><\(name)>\(UPnPXMLTemplates.xmlEscape(value))</\(name)></e:property>"
+        }
+        func variable(_ name: String, _ value: String) -> String {
+            "<\(name) val=\"\(UPnPXMLTemplates.xmlEscape(value))\"/>"
+        }
+        let properties: String
+        if path == "/AVTransport/event" {
+            let values = variable("TransportState", engine.state.rawValue) +
+                variable("TransportStatus", "OK") + variable("TransportPlaySpeed", "1") +
+                variable("AVTransportURI", engine.currentURI) + variable("AVTransportURIMetaData", engine.rawMetadata) +
+                variable("CurrentTrackURI", engine.currentURI) + variable("CurrentTrackMetaData", engine.rawMetadata) +
+                variable("CurrentTrack", engine.currentURI.isEmpty ? "0" : "1") +
+                variable("NumberOfTracks", engine.currentURI.isEmpty ? "0" : "1") +
+                variable("CurrentTrackDuration", engine.formatDuration(engine.duration)) +
+                variable("CurrentMediaDuration", engine.formatDuration(engine.duration)) +
+                variable("NextAVTransportURI", engine.nextURI) + variable("NextAVTransportURIMetaData", engine.nextMetadata) +
+                variable("CurrentTransportActions", engine.transportActions)
+            properties = property("LastChange", "<Event xmlns=\"urn:schemas-upnp-org:metadata-1-0/AVT/\"><InstanceID val=\"0\">\(values)</InstanceID></Event>")
+        } else if path == "/RenderingControl/event" {
+            let values = "<Volume channel=\"Master\" val=\"\(engine.getVolumeInt())\"/><Mute channel=\"Master\" val=\"\(engine.isMuted ? 1 : 0)\"/>"
+            properties = property("LastChange", "<Event xmlns=\"urn:schemas-upnp-org:metadata-1-0/RCS/\"><InstanceID val=\"0\">\(values)</InstanceID></Event>")
+        } else {
+            properties = property("SourceProtocolInfo", "") + property("SinkProtocolInfo", Self.sinkProtocols) + property("CurrentConnectionIDs", "0")
+        }
+        return "<?xml version=\"1.0\" encoding=\"utf-8\"?><e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">\(properties)</e:propertyset>"
+    }
+
     // MARK: - SOAP Helper
     
     private func extractSOAPActionName(actionHeader: String, body: String) -> String {
@@ -467,7 +567,8 @@ public final class UPnPHTTPServer {
     }
     
     private func extractXMLTag(name: String, from text: String) -> String? {
-        let pattern = "<(?:\\w+:)?\(name)[^>]*>(.*?)</(?:\\w+:)?\(name)>"
+        if text.range(of: "<(?:\\w+:)?\(name)\\s*/>", options: .regularExpression) != nil { return "" }
+        let pattern = "<(?:\\w+:)?\(name)(?:\\s[^>]*)?>(.*?)</(?:\\w+:)?\(name)>"
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
             return nil
         }
@@ -475,6 +576,11 @@ public final class UPnPHTTPServer {
         if let match = regex.firstMatch(in: text, options: [], range: nsRange),
            let r = Range(match.range(at: 1), in: text) {
             return String(text[r])
+                .replacingOccurrences(of: "&lt;", with: "<")
+                .replacingOccurrences(of: "&gt;", with: ">")
+                .replacingOccurrences(of: "&quot;", with: "\"")
+                .replacingOccurrences(of: "&apos;", with: "'")
+                .replacingOccurrences(of: "&amp;", with: "&")
         }
         return nil
     }

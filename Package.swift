@@ -18,6 +18,7 @@ let package = Package(
             name: "MacDLNA",
             dependencies: [],
             path: "Sources/MacDLNA"
-        )
+        ),
+        .testTarget(name: "MacDLNATests", dependencies: ["MacDLNA"])
     ]
 )

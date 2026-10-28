@@ -28,16 +28,75 @@ public final class AudioEngine: ObservableObject {
     @Published public var volume: Float = 0.8 {
         didSet {
             player.volume = volume
+            NotificationCenter.default.post(name: Self.transportChanged, object: self)
         }
     }
     @Published public var isMuted: Bool = false {
         didSet {
             player.isMuted = isMuted
+            NotificationCenter.default.post(name: Self.transportChanged, object: self)
         }
     }
     @Published public private(set) var rawMetadata: String = ""
     @Published public private(set) var logs: [String] = []
     
+    @Published public private(set) var canGoNext = false
+    @Published public private(set) var canGoPrevious = false
+    public var nextURI: String { playbackQueue.next?.uri ?? "" }
+    public var nextMetadata: String { playbackQueue.next?.metadata ?? "" }
+    public var transportActions: String {
+        guard !currentURI.isEmpty else { return "" }
+        return (["Play", "Pause", "Stop", "Seek"] +
+                (canGoNext ? ["Next"] : []) + (canGoPrevious ? ["Previous"] : [])).joined(separator: ",")
+    }
+    static let transportChanged = Notification.Name("MacDLNATransportChanged")
+    private var playbackQueue = PlaybackQueue()
+    private var shouldPlayWhenReady = true
+    private var notificationTokens: [NSObjectProtocol] = []
+
+    // All transport mutations and SOAP snapshots are serialized on the main thread.
+    private func onMain<T>(_ work: () -> T) -> T {
+        if Thread.isMainThread { return work() }
+        return DispatchQueue.main.sync(execute: work)
+    }
+
+    public func setNextURI(uri: String, metadata: String?) {
+        onMain {
+            playbackQueue.setNext(uri.isEmpty ? nil : PlaybackTrack(uri: uri, metadata: metadata ?? ""))
+            refreshQueueAvailability()
+            log(uri.isEmpty ? "已清空下一首" : "已接收下一首，播放结束后自动续播")
+            updateNowPlayingInfo()
+        }
+    }
+
+    @discardableResult
+    public func next() -> Bool {
+        onMain {
+            guard let track = playbackQueue.advance() else {
+                log("无法下一曲：控制端尚未提供下一首地址")
+                return false
+            }
+            loadTrack(track)
+            return true
+        }
+    }
+
+    @discardableResult
+    public func previous() -> Bool {
+        onMain {
+            guard let track = playbackQueue.previous() else { return false }
+            loadTrack(track)
+            return true
+        }
+    }
+
+    private func refreshQueueAvailability() {
+        canGoNext = playbackQueue.next != nil
+        canGoPrevious = playbackQueue.canGoPrevious
+        MPRemoteCommandCenter.shared().nextTrackCommand.isEnabled = canGoNext
+        MPRemoteCommandCenter.shared().previousTrackCommand.isEnabled = canGoPrevious
+    }
+
     // MARK: - Internal Player
     
     private var player: AVPlayer
@@ -47,11 +106,11 @@ public final class AudioEngine: ObservableObject {
     private var durationObserver: NSKeyValueObservation?
     private var cancellables = Set<AnyCancellable>()
     
-    private init() {
-        self.player = AVPlayer()
+    init(player: AVPlayer = AVPlayer(), configureSystemControls: Bool = true) {
+        self.player = player
         self.player.volume = 0.8
         
-        setupRemoteCommands()
+        if configureSystemControls { setupRemoteCommands() }
         setupTimeObserver()
         setupNotificationObservers()
         
@@ -78,93 +137,123 @@ public final class AudioEngine: ObservableObject {
     // MARK: - DLNA Control Methods
     
     public func setURI(uri: String, metadata: String?) {
-        DispatchQueue.main.async { [weak self] in
+        onMain {
+            let track = uri.isEmpty ? nil : PlaybackTrack(uri: uri, metadata: metadata ?? "")
+            playbackQueue.replaceCurrent(track)
+            if let track {
+                loadTrack(track)
+            } else {
+                cleanUpCurrentItem()
+                player.pause()
+                player.replaceCurrentItem(with: nil)
+                playerItem = nil
+                shouldPlayWhenReady = false
+                currentURI = ""
+                rawMetadata = ""
+                duration = 0
+                currentTime = 0
+                parseDIDLMetadata("")
+                state = .noMedia
+                refreshQueueAvailability()
+                updateNowPlayingInfo()
+            }
+        }
+    }
+
+    private func loadTrack(_ track: PlaybackTrack) {
+        let uri = track.uri
+        let metadata: String? = track.metadata
+        self.log("收到 SetAVTransportURI: \(uri)")
+        self.currentURI = uri
+        self.rawMetadata = metadata ?? ""
+        self.currentTime = 0.0
+        self.duration = 0.0
+        self.shouldPlayWhenReady = true
+        self.refreshQueueAvailability()
+
+        // 解析元数据 (DIDL-Lite)
+        self.parseDIDLMetadata(metadata ?? "")
+
+        guard let url = URL(string: uri) else {
+            self.log("无效的音频 URL: \(uri)")
+            self.state = .noMedia
+            return
+        }
+
+        self.cleanUpCurrentItem()
+
+        // 配置请求头与 Asset
+        let asset = AVURLAsset(url: url, options: [
+            "AVURLAssetHTTPHeaderFieldsKey": [
+                "User-Agent": "MacDLNA/1.0 (Macintosh; Apple Silicon) AVFoundation",
+                "Accept": "*/*"
+            ]
+        ])
+        let item = AVPlayerItem(asset: asset)
+        self.playerItem = item
+        self.state = .transitioning
+
+        // 监听状态
+        self.statusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
             guard let self = self else { return }
-            self.log("收到 SetAVTransportURI: \(uri)")
-            self.currentURI = uri
-            self.rawMetadata = metadata ?? ""
-            self.currentTime = 0.0
-            
-            // 解析元数据 (DIDL-Lite)
-            self.parseDIDLMetadata(metadata ?? "")
-            
-            guard let url = URL(string: uri) else {
-                self.log("无效的音频 URL: \(uri)")
-                self.state = .noMedia
-                return
-            }
-            
-            self.cleanUpCurrentItem()
-            
-            // 配置请求头与 Asset
-            let asset = AVURLAsset(url: url, options: [
-                "AVURLAssetHTTPHeaderFieldsKey": [
-                    "User-Agent": "MacDLNA/1.0 (Macintosh; Apple Silicon) AVFoundation",
-                    "Accept": "*/*"
-                ]
-            ])
-            let item = AVPlayerItem(asset: asset)
-            self.playerItem = item
-            self.state = .transitioning
-            
-            // 监听状态
-            self.statusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-                guard let self = self else { return }
-                DispatchQueue.main.async {
-                    switch item.status {
-                    case .readyToPlay:
-                        let dur = item.duration.seconds
-                        if !dur.isNaN && dur > 0 {
-                            self.duration = dur
-                        }
-                        self.log("音频流加载就绪，时长: \(self.formatDuration(self.duration))")
-                        self.updateNowPlayingInfo()
-                        
-                        // 准备就绪自动开始播放
-                        self.player.play()
-                        self.state = .playing
-                    case .failed:
-                        let err = item.error?.localizedDescription ?? "未知错误"
-                        self.log("音频流加载失败: \(err)")
-                        
-                        // 详细 HLS / CoreMedia 诊断
-                        if let errorLog = item.errorLog(), !errorLog.events.isEmpty {
-                            for ev in errorLog.events {
-                                self.log("HLS 报错: HTTP \(ev.errorStatusCode), \(ev.errorComment ?? "无说明")")
-                            }
-                        }
-                        if let nsErr = item.error as NSError?,
-                           let underlying = nsErr.userInfo[NSUnderlyingErrorKey] as? NSError {
-                            self.log("底层错误: [\(underlying.domain) \(underlying.code)] \(underlying.localizedDescription)")
-                        }
-                        
-                        self.state = .stopped
-                    default:
-                        break
-                    }
-                }
-            }
-            
-            self.durationObserver = item.observe(\.duration, options: [.new]) { [weak self] item, _ in
-                guard let self = self else { return }
-                DispatchQueue.main.async {
+            DispatchQueue.main.async {
+                guard self.playerItem === item else { return }
+                switch item.status {
+                case .readyToPlay:
                     let dur = item.duration.seconds
                     if !dur.isNaN && dur > 0 {
                         self.duration = dur
-                        self.updateNowPlayingInfo()
                     }
+                    self.log("音频流加载就绪，时长: \(self.formatDuration(self.duration))")
+                    if self.shouldPlayWhenReady {
+                        self.player.play()
+                        self.state = .playing
+                    }
+                    self.updateNowPlayingInfo()
+                case .failed:
+                    let err = item.error?.localizedDescription ?? "未知错误"
+                    self.log("音频流加载失败: \(err)")
+
+                    // 详细 HLS / CoreMedia 诊断
+                    if let errorLog = item.errorLog(), !errorLog.events.isEmpty {
+                        for ev in errorLog.events {
+                            self.log("HLS 报错: HTTP \(ev.errorStatusCode), \(ev.errorComment ?? "无说明")")
+                        }
+                    }
+                    if let nsErr = item.error as NSError?,
+                       let underlying = nsErr.userInfo[NSUnderlyingErrorKey] as? NSError {
+                        self.log("底层错误: [\(underlying.domain) \(underlying.code)] \(underlying.localizedDescription)")
+                    }
+
+                    self.state = .stopped
+                    self.updateNowPlayingInfo()
+                default:
+                    break
                 }
             }
-            
-            self.player.replaceCurrentItem(with: item)
-            self.state = .stopped
-            self.updateNowPlayingInfo()
         }
-    }
-    
-    public func play() {
-        DispatchQueue.main.async { [weak self] in
+
+        self.durationObserver = item.observe(\.duration, options: [.new]) { [weak self] item, _ in
             guard let self = self else { return }
+            DispatchQueue.main.async {
+                guard self.playerItem === item else { return }
+                let dur = item.duration.seconds
+                if !dur.isNaN && dur > 0 {
+                    self.duration = dur
+                    self.updateNowPlayingInfo()
+                }
+            }
+        }
+
+        self.player.replaceCurrentItem(with: item)
+        self.updateNowPlayingInfo()
+    }
+
+    public func play() {
+        onMain { [weak self] in
+            guard let self = self else { return }
+            guard self.playerItem != nil else { return }
+            self.shouldPlayWhenReady = true
             self.log("播放指令 (Play)")
             self.player.play()
             self.state = .playing
@@ -173,8 +262,9 @@ public final class AudioEngine: ObservableObject {
     }
     
     public func pause() {
-        DispatchQueue.main.async { [weak self] in
+        onMain { [weak self] in
             guard let self = self else { return }
+            self.shouldPlayWhenReady = false
             self.log("暂停指令 (Pause)")
             self.player.pause()
             self.state = .paused
@@ -183,8 +273,9 @@ public final class AudioEngine: ObservableObject {
     }
     
     public func stop() {
-        DispatchQueue.main.async { [weak self] in
+        onMain { [weak self] in
             guard let self = self else { return }
+            self.shouldPlayWhenReady = false
             self.log("停止指令 (Stop)")
             self.player.pause()
             self.player.seek(to: .zero)
@@ -196,7 +287,7 @@ public final class AudioEngine: ObservableObject {
     }
     
     public func seek(toSeconds seconds: Double) {
-        DispatchQueue.main.async { [weak self] in
+        onMain { [weak self] in
             guard let self = self else { return }
             let clamped = max(0, min(seconds, self.duration > 0 ? self.duration : seconds))
             self.log("进度跳转指令 (Seek to \(self.formatDuration(clamped)))")
@@ -217,7 +308,7 @@ public final class AudioEngine: ObservableObject {
     }
     
     public func setVolumeInt(_ vol: Int) {
-        DispatchQueue.main.async { [weak self] in
+        onMain { [weak self] in
             guard let self = self else { return }
             let clamped = max(0, min(100, vol))
             self.volume = Float(clamped) / 100.0
@@ -230,7 +321,7 @@ public final class AudioEngine: ObservableObject {
     }
     
     public func setMuteBool(_ mute: Bool) {
-        DispatchQueue.main.async { [weak self] in
+        onMain { [weak self] in
             guard let self = self else { return }
             self.isMuted = mute
             self.log("设置静音: \(mute)")
@@ -240,6 +331,7 @@ public final class AudioEngine: ObservableObject {
     // MARK: - DIDL-Lite Metadata Parsing
     
     private func parseDIDLMetadata(_ xml: String) {
+        LyricService.shared.loadLRC("")
         if xml.isEmpty {
             self.title = "未知曲目"
             self.artist = "未知艺术家"
@@ -249,7 +341,7 @@ public final class AudioEngine: ObservableObject {
         }
         
         // UPnP SOAP 中的 DIDL-Lite 元数据通常被整体转义 (&lt;DIDL-Lite...&gt;)
-        let cleanXML = (xml.contains("&lt;") || xml.contains("&amp;")) ? unescapeXML(xml) : xml
+        let cleanXML = xml.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("&lt;") ? unescapeXML(xml) : xml
         
         let titleVal = extractTagValue(tag: "dc:title", from: cleanXML) ??
                        extractTagValue(tag: "title", from: cleanXML) ?? "未知曲目"
@@ -302,11 +394,13 @@ public final class AudioEngine: ObservableObject {
     }
     
     private func fetchCoverArt(from url: URL) {
+        let requestedURI = currentURI
         URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
             guard let self = self, let data = data, let image = NSImage(data: data) else {
                 return
             }
             DispatchQueue.main.async {
+                guard self.currentURI == requestedURI else { return }
                 self.coverImage = image
                 self.updateNowPlayingInfo()
             }
@@ -318,6 +412,15 @@ public final class AudioEngine: ObservableObject {
     private func setupRemoteCommands() {
         let center = MPRemoteCommandCenter.shared()
         
+        center.nextTrackCommand.isEnabled = false
+        center.nextTrackCommand.addTarget { [weak self] _ in
+            self?.next() == true ? .success : .noSuchContent
+        }
+        center.previousTrackCommand.isEnabled = false
+        center.previousTrackCommand.addTarget { [weak self] _ in
+            self?.previous() == true ? .success : .noSuchContent
+        }
+
         center.playCommand.isEnabled = true
         center.playCommand.addTarget { [weak self] _ in
             self?.play()
@@ -377,6 +480,7 @@ public final class AudioEngine: ObservableObject {
         }
         
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        NotificationCenter.default.post(name: Self.transportChanged, object: self)
     }
     
     // MARK: - Observers
@@ -394,28 +498,36 @@ public final class AudioEngine: ObservableObject {
     }
     
     private func setupNotificationObservers() {
-        NotificationCenter.default.addObserver(
+        notificationTokens.append(NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
-            guard let self = self else { return }
+        ) { [weak self] notification in
+            guard let self = self, let item = notification.object as? AVPlayerItem,
+                  self.playerItem === item, self.state == .playing else { return }
             self.log("曲目播放完毕")
+            if self.canGoNext {
+                self.next()
+                return
+            }
+            self.log("等待控制端提供下一首；当前没有缓存的下一首地址")
             self.state = .stopped
             self.currentTime = self.duration
             self.updateNowPlayingInfo()
-        }
+        })
         
-        NotificationCenter.default.addObserver(
+        notificationTokens.append(NotificationCenter.default.addObserver(
             forName: .AVPlayerItemFailedToPlayToEndTime,
             object: nil,
             queue: .main
         ) { [weak self] notif in
-            guard let self = self else { return }
+            guard let self = self, let item = notif.object as? AVPlayerItem,
+                  self.playerItem === item else { return }
             let err = notif.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
             self.log("播放中断异常: \(err?.localizedDescription ?? "未知")")
             self.state = .stopped
-        }
+            self.updateNowPlayingInfo()
+        })
     }
     
     private func cleanUpCurrentItem() {
@@ -426,6 +538,7 @@ public final class AudioEngine: ObservableObject {
     }
     
     deinit {
+        notificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
         cleanUpCurrentItem()
         if let token = timeObserverToken {
             player.removeTimeObserver(token)
