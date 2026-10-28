@@ -16,8 +16,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  prepare-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --draft --title "$TAG" --generate-notes
+          fi
+
   build:
     name: Build ${{ matrix.arch }}
+    needs: [prepare-release]
+    if: ${{ !cancelled() && (needs.prepare-release.result == 'success' || needs.prepare-release.result == 'skipped') }}
+    permissions:
+      contents: write
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     strategy:
@@ -55,10 +75,25 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: ditto -c -k --sequesterRsrc --keepParent MacDLNA.app "MacDLNA-macos-${ARCH}.zip"
 
-      - name: Upload app
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: MacDLNA-macos-${{ matrix.arch }}
-          path: MacDLNA-macos-${{ matrix.arch }}.zip
-          if-no-files-found: error
-          retention-days: 14
+      - name: Upload release asset
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          ARCH: ${{ matrix.arch }}
+        run: gh release upload "$TAG" "MacDLNA-macos-${ARCH}.zip" --clobber
+
+  publish-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release edit "$TAG" --draft=false
